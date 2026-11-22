@@ -11,6 +11,7 @@ const els = {
   sendBtn: document.getElementById('sendBtn'),
   stopBtn: document.getElementById('stopBtn'),
   summarizeBtn: document.getElementById('summarizeBtn'),
+  translateBtn: document.getElementById('translateBtn'),
   refreshBtn: document.getElementById('refreshBtn'),
   clearBtn: document.getElementById('clearBtn'),
   settingsBtn: document.getElementById('settingsBtn'),
@@ -39,6 +40,7 @@ const state = {
   historyChanges: 0,
   clearCount: 0,
   streaming: false,
+  preparingTranslation: false,
   clearing: false,
   abort: null,
   activeTurn: null,
@@ -192,7 +194,7 @@ async function refreshPageContext() {
     state.page = null;
     setPageLabel('没有可用的标签页', true);
     refreshHint();
-    return;
+    return null;
   }
 
   setPageLabel(`读取中：${tab.title || tab.url || ''}`);
@@ -212,6 +214,7 @@ async function refreshPageContext() {
     setPageLabel(`${tab.title || tab.url || '当前页面'}（无法读取正文）`, true);
   }
   refreshHint();
+  return state.page;
 }
 
 function scheduleRefresh() {
@@ -221,15 +224,15 @@ function scheduleRefresh() {
   }, 400);
 }
 
-function pageBlock() {
-  if (!state.page || !state.page.text) return '';
+function pageBlock(page = state.page) {
+  if (!page || !page.text) return '';
   const limit = Math.max(2000, Number(state.settings.pageCharLimit) || 40000);
-  const text = state.page.text;
+  const text = page.text;
   const truncated = text.length > limit;
   return [
     '【当前页面】',
-    `标题：${state.page.title || '(无)'}`,
-    `URL：${state.page.url || '(无)'}`,
+    `标题：${page.title || '(无)'}`,
+    `URL：${page.url || '(无)'}`,
     `正文${truncated ? `（超长，已截断到前 ${formatNumber(limit)} 字）` : ''}：`,
     '"""',
     text.slice(0, limit),
@@ -416,7 +419,7 @@ async function clearHistory() {
   if (state.clearing) return;
   state.clearing = true;
   state.clearCount++;
-  setBusy(state.streaming);
+  updateRequestControls();
   try {
     await updateHistory('clear');
     state.abort?.abort();
@@ -428,18 +431,16 @@ async function clearHistory() {
     appendError('无法清空本地对话，请重试。');
   } finally {
     state.clearing = false;
-    setBusy(state.streaming);
+    updateRequestControls();
   }
 }
 
 // ---------------------------------------------------------------- 请求
 
-function buildRequestMessages(history) {
+function buildRequestMessages(history, pageContext) {
   const systemParts = [state.settings.systemPrompt || DEFAULT_SETTINGS.systemPrompt];
-  if (state.settings.attachPage !== false) {
-    const block = pageBlock();
-    if (block) systemParts.push(block);
-  }
+  const block = pageContext ?? (state.settings.attachPage !== false ? pageBlock() : '');
+  if (block) systemParts.push(block);
 
   const messages = [{ role: 'system', content: systemParts.filter(Boolean).join('\n\n') }];
   for (const message of history.slice(-14)) {
@@ -448,17 +449,27 @@ function buildRequestMessages(history) {
   return messages;
 }
 
-function setBusy(busy) {
-  state.streaming = busy;
-  els.sendBtn.disabled = busy || state.clearing;
-  els.summarizeBtn.disabled = busy || state.clearing;
-  els.clearBtn.disabled = state.clearing;
-  els.stopBtn.hidden = !busy;
+function requestBusy() {
+  return state.streaming || state.preparingTranslation || state.clearing;
 }
 
-async function send(rawText) {
+function updateRequestControls() {
+  const busy = requestBusy();
+  els.sendBtn.disabled = busy;
+  els.summarizeBtn.disabled = busy;
+  els.translateBtn.disabled = busy;
+  els.clearBtn.disabled = state.clearing;
+  els.stopBtn.hidden = !state.streaming;
+}
+
+function setBusy(busy) {
+  state.streaming = busy;
+  updateRequestControls();
+}
+
+async function send(rawText, { pageContext } = {}) {
   const text = String(rawText || '').trim();
-  if (!text || state.streaming || state.clearing) return;
+  if (!text || requestBusy()) return;
 
   if (!state.settings.apiKey) {
     appendNotice('请先点右上角 ⚙ 填写 Base URL、API Key 和模型名。');
@@ -501,7 +512,7 @@ async function send(rawText) {
       model: state.settings.model,
       temperature: Number(state.settings.temperature),
       maxTokens: Number(state.settings.maxTokens) || 0,
-      messages: buildRequestMessages(history),
+      messages: buildRequestMessages(history, pageContext),
       signal: controller.signal
     });
 
@@ -581,6 +592,7 @@ async function handleSelection(rawText) {
 }
 
 async function summarizePage() {
+  if (requestBusy()) return;
   if (!state.page) await refreshPageContext().catch(() => {});
   if (!state.page || !state.page.text) {
     appendNotice('这个页面读不到正文（可能是浏览器内部页面、PDF 查看器或尚未加载完）。可以手动把内容粘贴到输入框再问。');
@@ -589,12 +601,36 @@ async function summarizePage() {
   await send('请总结这个页面的主要内容：先给 3–5 条要点，再给一句话结论。如果页面有明显结构，按结构列。');
 }
 
+async function translatePage() {
+  if (requestBusy()) return;
+  const clearCount = state.clearCount;
+  state.preparingTranslation = true;
+  updateRequestControls();
+  let page;
+  try {
+    page = await refreshPageContext().catch(() => null);
+  } finally {
+    state.preparingTranslation = false;
+    updateRequestControls();
+  }
+  if (clearCount !== state.clearCount || state.clearing) return;
+
+  const pageContext = pageBlock(page);
+  if (!pageContext) {
+    appendNotice('无法读取当前页面正文，暂时不能翻译。你可以把要翻译的文字粘贴到输入框。');
+    return;
+  }
+  // 显式翻译需要本页正文，但不改变普通提问的「附带页面」设置。
+  await send('请把当前页面的正文逐段翻译成简体中文，保留标题、段落和列表结构。已有的简体中文内容保持原样。只输出译文，不要总结或补写。', { pageContext });
+}
+
 function bindEvents() {
   els.sendBtn.addEventListener('click', () => send(els.input.value).catch(() => {}));
   els.stopBtn.addEventListener('click', () => {
     if (state.abort) state.abort.abort();
   });
   els.summarizeBtn.addEventListener('click', () => summarizePage().catch(() => {}));
+  els.translateBtn.addEventListener('click', () => translatePage().catch(() => {}));
   els.refreshBtn.addEventListener('click', () => refreshPageContext().catch(() => {}));
   els.clearBtn.addEventListener('click', clearHistory);
   els.settingsBtn.addEventListener('click', openSettings);
@@ -645,7 +681,7 @@ function bindEvents() {
 // ---------------------------------------------------------------- 消息入口
 
 async function consumePendingSelection() {
-  if (state.streaming || state.clearing) return false;
+  if (requestBusy()) return false;
   const clearCount = state.clearCount;
   const pending = await chrome.runtime.sendMessage({ type: 'TAKE_PENDING_SELECTION' });
   if (!pending?.text || clearCount !== state.clearCount || state.clearing) return false;

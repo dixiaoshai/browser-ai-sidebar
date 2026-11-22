@@ -309,6 +309,93 @@ async function clickFloatButton(client) {
   return label;
 }
 
+// Use real Range and button rectangles, not assumptions about font-dependent button size.
+async function checkSelectionPlacement(client) {
+  async function selectFixture({ top, width, text, releaseX = 10, releaseY = 700 }) {
+    await evaluate(client, `(() => {
+      document.getElementById('placement-fixture')?.remove();
+      const el = document.createElement('div');
+      el.id = 'placement-fixture';
+      el.style.cssText = 'position:fixed;left:150px;top:${top}px;width:${width}px;font:16px/24px sans-serif;z-index:1';
+      el.textContent = ${JSON.stringify(text)};
+      document.body.appendChild(el);
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new MouseEvent('mouseup', { bubbles:true, clientX:${releaseX}, clientY:${releaseY} }));
+    })()`);
+    await waitFor(client, `(() => {
+      const b = document.querySelector('[data-ai-sidebar-float]')?.shadowRoot?.querySelector('button');
+      return b && getComputedStyle(b).display !== 'none';
+    })()`, 5000, 'placement fixture button');
+    // Give any queued handler time to finish before measuring.
+    await sleep(100);
+    return evaluate(client, `(() => {
+      const range = getSelection().getRangeAt(0);
+      const selection = range.getBoundingClientRect();
+      const button = document.querySelector('[data-ai-sidebar-float]').shadowRoot.querySelector('button').getBoundingClientRect();
+      const rect = r => ({left:r.left, right:r.right, top:r.top, bottom:r.bottom, width:r.width, height:r.height});
+      return { selection:rect(selection), button:rect(button), lines:range.getClientRects().length,
+        viewport:{width:innerWidth,height:innerHeight} };
+    })()`);
+  }
+  function check(info, direction, label) {
+    const { selection: s, button: b, viewport: v } = info;
+    const epsilon = 0.75;
+    if (!(b.width > 0 && b.height > 0) || b.left < 8 - epsilon || b.top < 8 - epsilon ||
+        b.right > v.width - 8 + epsilon || b.bottom > v.height - 8 + epsilon) {
+      fail(`${label}: button outside viewport margin: ${JSON.stringify(info)}`);
+    }
+    if (direction === 'above' && b.bottom > s.top - 20 + epsilon ||
+        direction === 'below' && b.top < s.bottom + 20 - epsilon) {
+      fail(`${label}: expected ${direction} with 20px gap from full selection: ${JSON.stringify(info)}`);
+    }
+  }
+  const single = 'This is selected text for the placement regression test.';
+  const typical = await selectFixture({ top: 180, width: 500, text: single });
+  check(typical, 'above', 'typical selection');
+  const top = await selectFixture({ top: 10, width: 500, text: single });
+  check(top, 'below', 'top-edge selection');
+  const multi = await selectFixture({ top: 300, width: 140, text: single.repeat(3) });
+  if (multi.lines < 2) fail(`multiline fixture did not wrap: ${JSON.stringify(multi)}`);
+  check(multi, 'above', 'multiline selection');
+
+  // Put the release point in the normal above candidate. It must not end up
+  // inside or within 12px of the actual button rectangle.
+  const x = (typical.button.left + typical.button.right) / 2;
+  const y = (typical.button.top + typical.button.bottom) / 2;
+  const near = await selectFixture({ top: 180, width: 500, text: single, releaseX: x, releaseY: y });
+  const dx = Math.max(near.button.left - x, 0, x - near.button.right);
+  const dy = Math.max(near.button.top - y, 0, y - near.button.bottom);
+  if (Math.hypot(dx, dy) < 11.25) fail(`button too close to mouseup: ${JSON.stringify(near)}`);
+
+  // A button mouseup must not schedule a fresh show after the click hides it.
+  await evaluate(client, `(() => {
+    const b = document.querySelector('[data-ai-sidebar-float]').shadowRoot.querySelector('button');
+    b.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, composed:true}));
+    b.click();
+  })()`);
+  await sleep(150);
+  const resurfaced = await evaluate(client, `getComputedStyle(document.querySelector('[data-ai-sidebar-float]').shadowRoot.querySelector('button')).display !== 'none'`);
+  if (resurfaced) fail('button mouseup rescheduled a show after click');
+
+  // Escape must cancel an already queued show, not just hide the current button.
+  await evaluate(client, `(() => {
+    document.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, clientX:10, clientY:700}));
+    document.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true, key:'Escape'}));
+  })()`);
+  await sleep(150);
+  const visible = await evaluate(client, `getComputedStyle(document.querySelector('[data-ai-sidebar-float]').shadowRoot.querySelector('button')).display !== 'none'`);
+  if (visible) fail('queued selection show survived Escape');
+  await evaluate(client, `(() => {
+    document.getElementById('placement-fixture').remove();
+    getSelection().removeAllRanges();
+  })()`);
+  console.log('     划词定位：普通、顶部、多行、鼠标释放点与取消排队 ✅');
+}
+
 // ---------------------------------------------------------------- 主流程
 
 let chrome;
@@ -411,6 +498,7 @@ try {
     'content.js 注入标记'
   );
   console.log('     内容脚本已注入 ✅');
+  await checkSelectionPlacement(page);
 
   // ============ 4. 默认 side 模式：不注入 dock，选区写入 pendingSelection ============
   log('4/8', '默认侧边栏：划词 → 点「问 AI」→ 底部 dock 不出现 + background 暂存选区');
@@ -772,6 +860,60 @@ try {
     fail(`清空重开后的请求不是使用原设置的新对话：${JSON.stringify(freshRequest)}`);
   }
   console.log('     侧边栏关闭重开恢复历史及追问；清空后重开保持设置并发送新对话 ✅');
+
+  // 模拟侧栏在文章标签页中打开：独立的扩展测试页本身不能作为正文来源。
+  await evaluate(sw, `chrome.tabs.update(${articleTabId}, { active: true })`);
+  await waitFor(cleared.client, `document.getElementById('pageTitle').textContent.includes('字')`, 5000, '翻译前已读取文章正文');
+  // 翻译必须重新提取当前页面，而不是复用前一次读取；选区不应被当成快捷操作指令。
+  const translateBodyMarker = '最新文章内容标记：翻译时必须读取这段新增正文。';
+  const translateSelectionMarker = '不应附带的选区快捷指令标记';
+  await evaluate(page, `(() => {
+    const paragraph = document.createElement('p');
+    paragraph.id = 'translate-body-fixture';
+    paragraph.textContent = ${JSON.stringify(translateBodyMarker)};
+    document.querySelector('article').appendChild(paragraph);
+    const selectionFixture = document.createElement('span');
+    selectionFixture.id = 'translate-selection-fixture';
+    selectionFixture.textContent = ${JSON.stringify(translateSelectionMarker)};
+    document.querySelector('nav').appendChild(selectionFixture);
+    const range = document.createRange();
+    range.selectNodeContents(selectionFixture);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  })()`);
+  const translateUi = await evaluate(cleared.client, `(() => {
+    const translate = document.getElementById('translateBtn');
+    const summarize = document.getElementById('summarizeBtn');
+    return { exists: !!translate, label: translate?.textContent.trim(),
+      adjacent: !!translate && !!summarize && translate.parentElement === summarize.parentElement &&
+        (translate.previousElementSibling === summarize || translate.nextElementSibling === summarize) };
+  })()`);
+  if (!translateUi.exists || !translateUi.adjacent || !translateUi.label.includes('翻译')) {
+    fail(`翻译本页按钮未与总结按钮相邻：${JSON.stringify(translateUi)}`);
+  }
+  const previousAnswers = await evaluate(cleared.client, `document.querySelectorAll('#messages .msg.assistant').length`);
+  serverHandle.captured.chatRequest = null;
+  await evaluate(cleared.client, 'document.getElementById("translateBtn").click()', { awaitPromise: false });
+  await waitFor(cleared.client, `(() => {
+    const answers = document.querySelectorAll('#messages .msg.assistant .msg-body');
+    return answers.length > ${previousAnswers} && answers[answers.length - 1].textContent.includes(${JSON.stringify(MOCK_REPLY_TEXT)}) &&
+      !document.getElementById('sendBtn').disabled;
+  })()`, 10000, '翻译流式回答完成');
+  const translateRequest = serverHandle.captured.chatRequest;
+  const translateSystem = String(translateRequest?.messages?.[0]?.content || '');
+  const translateUser = String(translateRequest?.messages?.at(-1)?.content || '');
+  if (translateRequest?.stream !== true || !translateUser.includes('翻译') ||
+      !translateUser.includes('简体中文') || !translateSystem.includes(translateBodyMarker) ||
+      translateSystem.includes(translateSelectionMarker) || translateUser.includes(translateSelectionMarker)) {
+    fail(`翻译请求未使用最新正文或包含选区：${JSON.stringify(translateRequest)}`);
+  }
+  await evaluate(page, `(() => {
+    document.getElementById('translate-body-fixture').remove();
+    document.getElementById('translate-selection-fixture').remove();
+    getSelection().removeAllRanges();
+  })()`);
+  console.log('     翻译本页：新提取正文、简体中文指令、不带选区、流式回答 ✅');
   await closeSideTarget(cleared.target, cleared.client);
 
   // ============ 8. 显式切换到底部模式 ============
@@ -939,6 +1081,24 @@ try {
   }
   console.log(`     dock 已收起（display=${closedDock.display}，height=${closedDock.height}）✅`);
 
+  // dock iframe 使用同一扩展页面；单独打开底部模式 URL 验证按钮存在，
+  // 不再发送请求，避免干扰上面的选区与历史断言。
+  const bottomTarget = await openTarget(`chrome-extension://${extId}/sidepanel/index.html?embed=bottom`);
+  const bottom = connect(bottomTarget.webSocketDebuggerUrl);
+  clients.push(bottom);
+  await bottom.send('Runtime.enable');
+  await waitFor(bottom, 'document.readyState === "complete"');
+  const bottomUi = await evaluate(bottom, `(() => {
+    const translate = document.getElementById('translateBtn');
+    const summarize = document.getElementById('summarizeBtn');
+    return { exists: !!translate, adjacent: !!translate && !!summarize &&
+      translate.parentElement === summarize.parentElement &&
+      (translate.previousElementSibling === summarize || translate.nextElementSibling === summarize) };
+  })()`);
+  if (!bottomUi.exists || !bottomUi.adjacent) fail(`底部模式缺少相邻的翻译本页按钮：${JSON.stringify(bottomUi)}`);
+  await closeSideTarget(bottomTarget, bottom);
+  console.log('     底部模式页面包含翻译本页按钮 ✅');
+
   console.log('\n✅ 端到端冒烟测试全部通过（默认浏览器侧边栏 + 可选底部悬浮）：');
   console.log('   - 扩展加载 / content.js 注入');
   console.log('   - 默认 side：划词浮层 → 点「问 AI」→ 不注入底部 dock + background 暂存 pendingSelection');
@@ -946,6 +1106,7 @@ try {
   console.log('   - 侧边栏页面：设置弹窗默认 panelMode=side，可正常打开');
   console.log('   - 侧边栏读取当前页面 → 页面字数');
   console.log('   - 总结本页 → SSE 流式渲染，请求携带页面正文');
+  console.log('   - 翻译本页 → 重新提取正文、简体中文指令、不带选区、流式渲染；底部模式按钮存在');
   console.log('   - 回答复制：复制原始 Markdown + 「已复制」反馈，用户消息无按钮；dock iframe 允许 clipboard-write');
   console.log('   - 侧边栏收到 SELECTION 广播 → 请求携带选区 + 页面正文');
   console.log('   - 显式切到 panelMode=bottom（等 background 生效）→ 划词点「问 AI」→ dock 展开（?embed=bottom）');

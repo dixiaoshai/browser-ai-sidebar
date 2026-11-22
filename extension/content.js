@@ -176,10 +176,15 @@
 
   // ---------------- 划词浮层 ----------------
 
+  const SELECTION_GAP = 20;
+  const VIEWPORT_MARGIN = 8;
+  const POINTER_GAP = 12;
+
   let host = null;
   let shadow = null;
   let button = null;
   let pendingSelection = '';
+  let selectionTimer;
 
   function ensureButton() {
     if (button) return;
@@ -235,19 +240,52 @@
   }
 
   function hideButton() {
+    clearTimeout(selectionTimer);
+    pendingSelection = '';
     if (button) button.style.display = 'none';
   }
 
-  function showButton(rect) {
+  function showButton(rect, releasePoint, text) {
+    const viewport = document.compatMode === 'BackCompat' ? document.body : document.documentElement;
+    const viewportWidth = viewport?.clientWidth || window.innerWidth;
+    const viewportHeight = viewport?.clientHeight || window.innerHeight;
+    if (rect.right <= 0 || rect.left >= viewportWidth || rect.bottom <= 0 || rect.top >= viewportHeight) {
+      hideButton();
+      return;
+    }
+
     ensureButton();
-    const top = Math.max(8, rect.top - 38);
-    const left = Math.min(
-      Math.max(8, rect.left + rect.width / 2 - 28),
-      Math.max(8, window.innerWidth - 90)
-    );
-    button.style.top = `${Math.round(top)}px`;
-    button.style.left = `${Math.round(left)}px`;
     button.style.display = 'flex';
+    const size = button.getBoundingClientRect();
+    const width = Math.ceil(size.width);
+    const height = Math.ceil(size.height);
+    const min = VIEWPORT_MARGIN;
+    const maxLeft = viewportWidth - width - min;
+    const maxTop = viewportHeight - height - min;
+    const centerLeft = clamp(Math.round((rect.left + rect.right - width) / 2), min, maxLeft);
+    const centerTop = clamp(Math.round((rect.top + rect.bottom - height) / 2), min, maxTop);
+
+    // 贴近视口边缘时换一侧，不把按钮硬挤回选区上方。
+    const positions = [
+      [centerLeft, Math.floor(rect.top - height - SELECTION_GAP)],
+      [centerLeft, Math.ceil(rect.bottom + SELECTION_GAP)],
+      [Math.ceil(rect.right + SELECTION_GAP), centerTop],
+      [Math.floor(rect.left - width - SELECTION_GAP), centerTop]
+    ];
+    const position = positions.find(([left, top]) =>
+      left >= min && left <= maxLeft && top >= min && top <= maxTop &&
+      (!releasePoint || releasePoint.x < left - POINTER_GAP || releasePoint.x > left + width + POINTER_GAP ||
+        releasePoint.y < top - POINTER_GAP || releasePoint.y > top + height + POINTER_GAP)
+    );
+    if (!position) {
+      hideButton();
+      return;
+    }
+
+    const [left, top] = position;
+    button.style.left = `${left}px`;
+    button.style.top = `${top}px`;
+    pendingSelection = text;
   }
 
   function inEditable(node) {
@@ -256,8 +294,9 @@
     return !!el.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]');
   }
 
-  function handleSelectionChange() {
-    setTimeout(() => {
+  function handleSelectionChange(releasePoint) {
+    clearTimeout(selectionTimer);
+    selectionTimer = setTimeout(() => {
       const selection = window.getSelection();
       if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
         hideButton();
@@ -272,26 +311,30 @@
         hideButton();
         return;
       }
-      const range = selection.getRangeAt(0);
-      const rects = range.getClientRects();
-      const rect = rects.length ? rects[rects.length - 1] : range.getBoundingClientRect();
-      if (!rect || (!rect.width && !rect.height)) {
+      const rect = selection.getRangeAt(0).getBoundingClientRect();
+      if (!rect.width || !rect.height) {
         hideButton();
         return;
       }
-      pendingSelection = text;
-      showButton(rect);
+      showButton(rect, releasePoint, text);
     }, 10);
   }
 
-  document.addEventListener('mouseup', handleSelectionChange, true);
+  function onAskButton(event) {
+    return host && event.composedPath().includes(host);
+  }
+
+  document.addEventListener('mouseup', (event) => {
+    if (event.button === 0 && !onAskButton(event)) {
+      handleSelectionChange({ x: event.clientX, y: event.clientY });
+    }
+  }, true);
   document.addEventListener('keyup', (event) => {
     if (event.key === 'Escape') hideButton();
-    else handleSelectionChange();
+    else if (!onAskButton(event)) handleSelectionChange();
   }, true);
   document.addEventListener('mousedown', (event) => {
-    if (host && event.composedPath && event.composedPath().includes(host)) return;
-    hideButton();
+    if (!onAskButton(event)) hideButton();
   }, true);
   window.addEventListener('scroll', hideButton, { passive: true, capture: true });
   window.addEventListener('resize', hideButton, { passive: true });
