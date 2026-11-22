@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>侧边 AI 阅读助手</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <span class="brand-name">AI 阅读</span>
+        <span class="model-tag" id="modelTag" title="当前模型"></span>
+      </div>
+      <div class="actions">
+        <button id="summarizeBtn" class="btn primary" type="button" title="总结当前页面">总结本页</button>
+        <button id="refreshBtn" class="btn" type="button" title="重新读取当前页面">重读</button>
+        <button id="clearBtn" class="btn icon" type="button" title="清空对话">⌫</button>
+        <button id="settingsBtn" class="btn icon" type="button" title="设置">⚙</button>
+      </div>
+    </header>
+
+    <div class="contextbar">
+      <span class="page-title" id="pageTitle">正在读取当前页面…</span>
+      <label class="toggle" title="是否在提问时附带当前页面正文">
+        <input type="checkbox" id="attachPage" checked />
+        <span>附带页面</span>
+      </label>
+    </div>
+
+    <main class="messages" id="messages" aria-live="polite"></main>
+
+    <footer class="composer">
+      <textarea
+        id="input"
+        rows="2"
+        placeholder="就当前页面提问…（Enter 发送，Shift+Enter 换行）"
+      ></textarea>
+      <div class="composer-actions">
+        <span class="hint" id="hint"></span>
+        <button id="stopBtn" class="btn danger" type="button" hidden>停止</button>
+        <button id="sendBtn" class="btn primary" type="button">发送</button>
+      </div>
+    </footer>
+
+    <dialog id="settingsDialog">
+      <form id="settingsForm" novalidate>
+        <h2>模型设置</h2>
+        <p class="muted">
+          兼容 OpenAI <code>/chat/completions</code> 协议。Key 只存在本机浏览器里，请求从本页面直接发往该地址，不经过任何中转。
+        </p>
+
+        <label class="field">
+          <span>Base URL</span>
+          <input id="baseUrl" type="url" placeholder="https://api.deepseek.com/v1" required />
+        </label>
+
+        <label class="field">
+          <span>API Key</span>
+          <input id="apiKey" type="password" placeholder="sk-…" autocomplete="off" />
+        </label>
+
+        <label class="field">
+          <span>模型名</span>
+          <input id="model" type="text" placeholder="deepseek-chat" required />
+        </label>
+
+        <div class="field-row">
+          <label class="field">
+            <span>温度</span>
+            <input id="temperature" type="number" min="0" max="2" step="0.1" />
+          </label>
+          <label class="field">
+            <span>页面正文上限（字）</span>
+            <input id="pageCharLimit" type="number" min="2000" step="1000" />
+          </label>
+        </div>
+
+        <label class="field">
+          <span>面板位置</span>
+          <select id="panelMode">
+            <option value="side">浏览器侧边栏（推荐）</option>
+            <option value="bottom">页面底部悬浮</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span>系统提示词</span>
+          <textarea id="systemPrompt" rows="4"></textarea>
+        </label>
+
+        <div class="test-result" id="testResult"></div>
+
+        <div class="dialog-actions">
+          <button type="button" id="testBtn" class="btn">测试连接</button>
+          <span class="spacer"></span>
+          <button type="button" id="cancelBtn" class="btn">取消</button>
+          <button type="submit" class="btn primary">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>

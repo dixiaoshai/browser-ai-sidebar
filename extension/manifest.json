@@ -1,0 +1,76 @@
+{
+  "manifest_version": 3,
+  "name": "侧边 AI 阅读助手",
+  "version": "0.4.0",
+  "description": "默认在浏览器原生侧边栏里用你自己的大模型（OpenAI 兼容接口）阅读网页，也可切换为页面底部悬浮面板：划词追问、整页总结、多轮对话，回答可一键复制。请求直接从浏览器发往你配置的服务，不经过任何中转。",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "clipboardWrite",
+    "contextMenus",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "打开 AI 侧边栏",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel/index.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+A",
+        "mac": "Alt+Shift+A"
+      }
+    }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "sidepanel/index.html",
+        "sidepanel/sidepanel.js",
+        "sidepanel/style.css",
+        "lib/openai.js",
+        "lib/markdown.js",
+        "lib/clipboard.js",
+        "icons/icon128.png"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}
