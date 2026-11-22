@@ -35,9 +35,13 @@ const els = {
 const state = {
   settings: { ...DEFAULT_SETTINGS },
   page: null, // { title, url, text, charCount }
-  messages: [], // { role, content }
+  messages: [], // { turnId, role, content }
+  historyChanges: 0,
+  clearCount: 0,
   streaming: false,
+  clearing: false,
   abort: null,
+  activeTurn: null,
   lastSelectionKey: '',
   lastSelectionAt: 0,
   refreshTimer: 0
@@ -293,11 +297,8 @@ const COPY_DONE_LABEL = '已复制';
 const COPY_FAIL_LABEL = '复制失败';
 const COPY_TITLE = '复制这条回答（Markdown 原文）';
 
-// 回答的原始 Markdown 与对应复制按钮：DOM 里渲染的是 HTML，复制时要拿到原始文本
-const answerTexts = new WeakMap();
-const copyButtons = new WeakMap();
-
-function createCopyButton(getText) {
+// DOM 里渲染的是 HTML，复制时使用回答的原始 Markdown。
+function createCopyButton(text) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = 'copy-btn';
@@ -307,7 +308,6 @@ function createCopyButton(getText) {
   let timer = 0;
 
   btn.addEventListener('click', async (event) => {
-    const text = getText();
     if (!text) return;
     // 键盘（Enter / 空格）或辅助技术触发时 event.detail 为 0；鼠标点击为 1
     const viaKeyboard = event.detail === 0;
@@ -331,13 +331,6 @@ function createCopyButton(getText) {
   return btn;
 }
 
-/** 流式渲染结束后登记回答原文，并让复制按钮出现（生成中不显示） */
-function setAnswerText(body, text) {
-  answerTexts.set(body, text || '');
-  const button = copyButtons.get(body);
-  if (button) button.hidden = !text;
-}
-
 function appendMessage(role, text) {
   const empty = els.messages.querySelector('.empty');
   if (empty) empty.remove();
@@ -357,20 +350,14 @@ function appendMessage(role, text) {
   body.className = 'msg-body';
   if (role === 'assistant') {
     body.innerHTML = renderMarkdown(text);
-    answerTexts.set(body, text || '');
-    const copyBtn = createCopyButton(() => answerTexts.get(body) || '');
-    // 流式生成中先不显示，生成结束（setAnswerText）后出现
-    copyBtn.hidden = !text;
-    copyButtons.set(body, copyBtn);
-    head.appendChild(copyBtn);
+    if (text) head.appendChild(createCopyButton(text));
   } else {
     body.textContent = text;
   }
 
   wrap.append(head, body);
   els.messages.appendChild(wrap);
-  scrollToBottom(true);
-  return { wrap, body };
+  return body;
 }
 
 function appendNotice(text) {
@@ -397,9 +384,57 @@ function appendError(text) {
   scrollToBottom(true);
 }
 
+// ---------------------------------------------------------------- 对话历史
+
+async function loadHistory() {
+  const version = state.historyChanges;
+  const { chatHistory } = await chrome.storage.local.get('chatHistory');
+  if (version === state.historyChanges) {
+    state.messages = Array.isArray(chatHistory) ? chatHistory : [];
+  }
+}
+
+async function updateHistory(action, turnId, content) {
+  const result = await chrome.runtime.sendMessage({ type: 'UPDATE_CHAT_HISTORY', action, turnId, content });
+  if (!result?.ok) throw new Error('对话存储操作失败');
+  return result.messages;
+}
+
+function renderHistory(messages = state.messages, preserveScroll = false) {
+  if (!messages.length) {
+    renderEmptyState();
+    return;
+  }
+  const previousTop = preserveScroll && !nearBottom() ? els.messages.scrollTop : null;
+  clearMessages();
+  for (const { role, content } of messages) appendMessage(role, content);
+  if (previousTop === null) scrollToBottom(true);
+  else els.messages.scrollTop = previousTop;
+}
+
+async function clearHistory() {
+  if (state.clearing) return;
+  state.clearing = true;
+  state.clearCount++;
+  setBusy(state.streaming);
+  try {
+    await updateHistory('clear');
+    state.abort?.abort();
+    els.input.value = '';
+    state.lastSelectionKey = '';
+    await loadHistory();
+    renderHistory();
+  } catch {
+    appendError('无法清空本地对话，请重试。');
+  } finally {
+    state.clearing = false;
+    setBusy(state.streaming);
+  }
+}
+
 // ---------------------------------------------------------------- 请求
 
-function buildRequestMessages() {
+function buildRequestMessages(history) {
   const systemParts = [state.settings.systemPrompt || DEFAULT_SETTINGS.systemPrompt];
   if (state.settings.attachPage !== false) {
     const block = pageBlock();
@@ -407,7 +442,7 @@ function buildRequestMessages() {
   }
 
   const messages = [{ role: 'system', content: systemParts.filter(Boolean).join('\n\n') }];
-  for (const message of state.messages.slice(-14)) {
+  for (const message of history.slice(-14)) {
     messages.push({ role: message.role, content: message.content });
   }
   return messages;
@@ -415,15 +450,15 @@ function buildRequestMessages() {
 
 function setBusy(busy) {
   state.streaming = busy;
-  els.sendBtn.disabled = busy;
-  els.summarizeBtn.disabled = busy;
+  els.sendBtn.disabled = busy || state.clearing;
+  els.summarizeBtn.disabled = busy || state.clearing;
+  els.clearBtn.disabled = state.clearing;
   els.stopBtn.hidden = !busy;
-  els.input.disabled = false;
 }
 
 async function send(rawText) {
   const text = String(rawText || '').trim();
-  if (!text || state.streaming) return;
+  if (!text || state.streaming || state.clearing) return;
 
   if (!state.settings.apiKey) {
     appendNotice('请先点右上角 ⚙ 填写 Base URL、API Key 和模型名。');
@@ -431,32 +466,43 @@ async function send(rawText) {
     return;
   }
 
-  els.input.value = '';
-  state.messages.push({ role: 'user', content: text });
-  appendMessage('user', text);
-
-  const { wrap, body } = appendMessage('assistant', '');
-  body.classList.add('streaming-cursor');
   setBusy(true);
-  state.abort = new AbortController();
+  const turnId = crypto.randomUUID();
+  const controller = new AbortController();
+  state.activeTurn = turnId;
+  state.abort = controller;
+
+  let history;
+  try {
+    // 先保存问题；即使生成期间关闭面板，重新打开仍看得到已发送的问题。
+    history = await updateHistory('start', turnId, text);
+  } catch {
+    state.activeTurn = null;
+    state.abort = null;
+    setBusy(false);
+    appendError('无法保存本地对话，消息未发送。');
+    return;
+  }
 
   let acc = '';
   let scheduled = 0;
-
-  const flush = () => {
-    body.innerHTML = renderMarkdown(acc) || '…';
-    scrollToBottom();
-  };
-
+  let failure;
   try {
+    controller.signal.throwIfAborted();
+    els.input.value = '';
+    renderHistory(history);
+    const body = appendMessage('assistant', '');
+    body.classList.add('streaming-cursor');
+    scrollToBottom(true);
+
     const stream = streamChat({
       baseUrl: state.settings.baseUrl,
       apiKey: state.settings.apiKey,
       model: state.settings.model,
       temperature: Number(state.settings.temperature),
       maxTokens: Number(state.settings.maxTokens) || 0,
-      messages: buildRequestMessages(),
-      signal: state.abort.signal
+      messages: buildRequestMessages(history),
+      signal: controller.signal
     });
 
     for await (const delta of stream) {
@@ -464,45 +510,39 @@ async function send(rawText) {
       if (!scheduled) {
         scheduled = requestAnimationFrame(() => {
           scheduled = 0;
-          flush();
+          body.innerHTML = renderMarkdown(acc) || '…';
+          scrollToBottom();
         });
       }
     }
-    if (scheduled) cancelAnimationFrame(scheduled);
-    scheduled = 0;
-    body.innerHTML = renderMarkdown(acc) || '（模型返回为空）';
-    setAnswerText(body, acc);
-    // 空回答不写进历史：部分 OpenAI 兼容服务会拒绝 content 为空的 assistant 消息
-    if (acc) state.messages.push({ role: 'assistant', content: acc });
   } catch (error) {
-    if (scheduled) cancelAnimationFrame(scheduled);
-    scheduled = 0;
-    const aborted = error && error.name === 'AbortError';
-    if (aborted) {
-      if (acc) {
-        body.innerHTML = renderMarkdown(acc);
-        setAnswerText(body, acc);
-        state.messages.push({ role: 'assistant', content: acc });
-        appendNotice('已停止生成。');
-      } else {
-        wrap.remove();
-      }
-    } else {
-      if (acc) {
-        body.innerHTML = renderMarkdown(acc);
-        setAnswerText(body, acc);
-        state.messages.push({ role: 'assistant', content: acc });
-      } else {
-        wrap.remove();
-      }
-      appendError(String(error && error.message ? error.message : error));
-    }
-  } finally {
-    body.classList.remove('streaming-cursor');
-    state.abort = null;
-    setBusy(false);
-    scrollToBottom();
+    failure = error;
   }
+  if (scheduled) cancelAnimationFrame(scheduled);
+
+  // 停止或请求出错时保留已收到的部分。空回答不进入模型上下文。
+  let saveFailed = false;
+  if (acc) {
+    await updateHistory('finish', turnId, acc).catch(() => { saveFailed = true; });
+  }
+  await loadHistory().catch(() => {});
+  renderHistory(state.messages, true);
+  if (state.messages.some((message) => message.turnId === turnId)) {
+    if (saveFailed) {
+      appendMessage('assistant', acc);
+      appendError('无法保存这条回答，重新打开面板后将不会显示。');
+    }
+    if (failure?.name === 'AbortError') {
+      appendNotice('已停止生成。');
+    } else if (failure) {
+      appendError(String(failure.message || failure));
+    } else if (!acc) {
+      appendNotice('（模型返回为空）');
+    }
+  }
+  state.activeTurn = null;
+  state.abort = null;
+  setBusy(false);
 }
 
 // ---------------------------------------------------------------- 交互
@@ -525,7 +565,9 @@ async function handleSelection(rawText) {
   state.lastSelectionKey = key;
   state.lastSelectionAt = now;
 
+  const clearCount = state.clearCount;
   await refreshPageContext().catch(() => {});
+  if (clearCount !== state.clearCount || state.clearing) return;
 
   if (!state.settings.apiKey) {
     els.input.value = selectionPrompt(text);
@@ -554,10 +596,7 @@ function bindEvents() {
   });
   els.summarizeBtn.addEventListener('click', () => summarizePage().catch(() => {}));
   els.refreshBtn.addEventListener('click', () => refreshPageContext().catch(() => {}));
-  els.clearBtn.addEventListener('click', () => {
-    state.messages = [];
-    renderEmptyState();
-  });
+  els.clearBtn.addEventListener('click', clearHistory);
   els.settingsBtn.addEventListener('click', openSettings);
   els.cancelBtn.addEventListener('click', () => els.dialog.close());
 
@@ -606,10 +645,10 @@ function bindEvents() {
 // ---------------------------------------------------------------- 消息入口
 
 async function consumePendingSelection() {
-  const stored = await chrome.storage.local.get('pendingSelection');
-  const pending = stored && stored.pendingSelection;
-  if (!pending || !pending.text) return false;
-  await chrome.storage.local.remove('pendingSelection').catch(() => {});
+  if (state.streaming || state.clearing) return false;
+  const clearCount = state.clearCount;
+  const pending = await chrome.runtime.sendMessage({ type: 'TAKE_PENDING_SELECTION' });
+  if (!pending?.text || clearCount !== state.clearCount || state.clearing) return false;
   if (Date.now() - (pending.at || 0) > 120000) return false;
   await handleSelection(pending.text);
   return true;
@@ -617,10 +656,10 @@ async function consumePendingSelection() {
 
 chrome.runtime.onMessage.addListener((message) => {
   if (!message) return;
-  if (message.type === 'SELECTION' && message.text) {
-    handleSelection(message.text).catch(() => {});
+  if (message.type === 'SELECTION' && message.pending) {
+    ready.then(consumePendingSelection).catch(() => {});
   } else if (message.type === 'SUMMARIZE_PAGE') {
-    summarizePage().catch(() => {});
+    ready.then(() => summarizePage()).catch(() => {});
   }
 });
 
@@ -629,26 +668,46 @@ chrome.tabs.onUpdated.addListener((_tabId, info) => {
   if (info && info.status === 'complete') scheduleRefresh();
 });
 
-// 侧边栏和底部 dock 可能同时存在：任一处改了设置，其他面板立即同步
+// 侧边栏和底部 dock 共享设置和对话历史。
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'local' || !changes.settings) return;
-  const next = changes.settings.newValue || {};
-  state.settings = { ...DEFAULT_SETTINGS, ...next };
-  refreshModelTag();
-  refreshHint();
-  if (els.attachPage) els.attachPage.checked = state.settings.attachPage !== false;
+  if (area !== 'local') return;
+  if (changes.settings) {
+    const next = changes.settings.newValue || {};
+    state.settings = { ...DEFAULT_SETTINGS, ...next };
+    refreshModelTag();
+    refreshHint();
+    els.attachPage.checked = state.settings.attachPage !== false;
+  }
+  if (changes.chatHistory) {
+    const { oldValue, newValue } = changes.chatHistory;
+    state.historyChanges++;
+    state.messages = Array.isArray(newValue) ? newValue : [];
+    const cleared = newValue === undefined;
+    if (cleared) {
+      state.clearCount++;
+      if (Array.isArray(oldValue) && oldValue.some((message) => message.turnId === state.activeTurn)) {
+        state.abort?.abort();
+      }
+    }
+    // 普通写入等当前流结束再渲染；清空需要立即移除旧消息。
+    if (!state.streaming || cleared) renderHistory();
+  }
 });
 
 // ---------------------------------------------------------------- 启动
 
+let historyLoadFailed = false;
+const ready = Promise.all([loadSettings(), loadHistory().catch(() => { historyLoadFailed = true; })]);
+
 (async function init() {
   if (EMBED) document.body.classList.add('embed');
-  await loadSettings();
+  await ready;
   refreshModelTag();
   bindEvents();
 
   els.attachPage.checked = state.settings.attachPage !== false;
-  renderEmptyState();
+  renderHistory();
+  if (historyLoadFailed) appendError('无法读取本地对话。');
   refreshHint();
 
   await refreshPageContext().catch(() => {});
@@ -657,7 +716,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (!consumed) {
     // 面板刚被打开时，background 可能还在写 pendingSelection，稍后再兜一次
     setTimeout(() => {
-      if (!state.messages.length) consumePendingSelection().catch(() => {});
+      if (!state.streaming && !state.clearing) consumePendingSelection().catch(() => {});
     }, 800);
   }
 

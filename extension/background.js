@@ -1,6 +1,6 @@
 /**
- * Service worker：负责“打开对话面板 + 转发消息 + 右键菜单”。
- * 不碰用户数据，也不发起任何模型请求（请求都在对话页面里直接发）。
+ * Service worker：负责打开对话面板、转发消息、右键菜单和本地对话存储。
+ * 不发起模型请求（请求都在对话页面里直接发）。
  *
  * 两种呈现方式（设置里可切换，默认浏览器侧边栏）：
  *   side   —— Chrome 原生 sidePanel（固定在右侧，默认模式）
@@ -132,23 +132,81 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     const text = String(info.selectionText || '').trim().slice(0, MAX_SELECTION);
     if (!text) return;
     openPanel(tab.id);
-    chrome.storage.local
-      .set({ pendingSelection: { text, at: Date.now() } })
-      .catch(() => {});
-    broadcast({ type: 'SELECTION', text });
+    queueSelection(text).catch(() => {});
   }
 });
 
+// 同一个对话由多个面板共享；串行读写，避免并行回复覆盖彼此或在清空后恢复旧消息。
+let storageWrites = Promise.resolve();
+function serializeStorage(task) {
+  const write = storageWrites.then(task);
+  storageWrites = write.catch(() => {});
+  return write;
+}
+
+async function queueSelection(text) {
+  await serializeStorage(() => chrome.storage.local.set({ pendingSelection: { text, at: Date.now() } }));
+  broadcast({ type: 'SELECTION', pending: true });
+}
+
+function takePendingSelection() {
+  return serializeStorage(async () => {
+    const { pendingSelection } = await chrome.storage.local.get('pendingSelection');
+    if (!pendingSelection) return null;
+    await chrome.storage.local.remove('pendingSelection');
+    return pendingSelection;
+  });
+}
+
+function updateChatHistory({ action, turnId, content }) {
+  return serializeStorage(async () => {
+    if (action === 'clear') {
+      await chrome.storage.local.remove(['chatHistory', 'pendingSelection']);
+      return [];
+    }
+
+    const { chatHistory } = await chrome.storage.local.get('chatHistory');
+    const messages = Array.isArray(chatHistory) ? chatHistory : [];
+    if (action === 'start') {
+      messages.push({ turnId, role: 'user', content });
+    } else {
+      const index = messages.findIndex((item) => item.turnId === turnId && item.role === 'user');
+      if (index === -1 || messages[index + 1]?.turnId === turnId) return messages;
+      messages.splice(index + 1, 0, { turnId, role: 'assistant', content });
+    }
+    await chrome.storage.local.set({ chatHistory: messages });
+    return messages;
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) return;
+
+  const fromPanel = sender.url?.split('?')[0] === chrome.runtime.getURL('sidepanel/index.html');
+  if (message.type === 'TAKE_PENDING_SELECTION' && fromPanel) {
+    takePendingSelection().then(sendResponse, () => sendResponse(null));
+    return true;
+  }
+
+  if (message.type === 'UPDATE_CHAT_HISTORY' && fromPanel) {
+    const { action, turnId, content } = message;
+    if (action !== 'clear' && !(
+      (action === 'start' || action === 'finish') &&
+      typeof turnId === 'string' && turnId && typeof content === 'string' && content
+    )) return;
+    updateChatHistory(message).then(
+      (messages) => sendResponse({ ok: true, messages }),
+      () => sendResponse({ ok: false })
+    );
+    return true;
+  }
 
   if (message.type === 'ASK_SELECTION') {
     const text = String(message.text || '').trim().slice(0, MAX_SELECTION);
     if (!text) return;
     const tabId = sender?.tab?.id;
     openPanel(tabId);
-    chrome.storage.local.set({ pendingSelection: { text, at: Date.now() } }).catch(() => {});
-    broadcast({ type: 'SELECTION', text });
+    queueSelection(text).catch(() => {});
     return;
   }
 

@@ -15,7 +15,8 @@
  *   4. 侧边栏页面加载 → 设置弹窗默认选中 side → 切到文章页 → 点「重读」→ 页面字数
  *   5. 点「总结本页」→ 走真实 SSE 流式渲染 → 校验请求里带了页面正文；
  *      回答里的「复制」按钮复制原始 Markdown 并给出「已复制」反馈
- *   6. 侧边栏收到 SELECTION 广播 → 请求里带选区 + 页面正文
+ *   6. 侧边栏收到 SELECTION 广播 → 请求里带选区 + 页面正文；关闭重开恢复历史、追问，
+ *      清空后再次关闭重开，验证设置保留且新请求没有旧历史
  *   7. 显式把 settings.panelMode 切成 'bottom'（等 background storage.onChanged 生效）
  *      → 再划词点「问 AI」→ 当前页展开底部 dock（iframe src 含 ?embed=bottom）
  *   8. dock iframe 轮询 pendingSelection → 请求里带选区 + 页面正文
@@ -50,6 +51,8 @@ const CDP_PORT = Number(process.env.CDP_PORT || 9337);
 // 模拟回答故意带 Markdown（粗体 + 列表）：界面渲染成 HTML，复制按钮应拿到原始 Markdown
 const MOCK_REPLY_MD = '**总结**：量子计算仍处于早期阶段。\n\n- 要点一：叠加态\n- 要点二：纠错';
 const MOCK_REPLY_TEXT = '总结：量子计算仍处于早期阶段。';
+const CLEAR_DURING_STREAM = '测试生成过程中清空对话';
+const PARTIAL_REPLY = '这段未完成的回答不能在清空后恢复。';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const ARTICLE_HTML = `<!doctype html>
@@ -91,6 +94,11 @@ function startServer() {
           captured.chatRequest = { raw: body };
         }
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store' });
+        if (captured.chatRequest.messages?.at(-1)?.content === CLEAR_DURING_STREAM) {
+          res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: PARTIAL_REPLY } }] })}\n\n`);
+          // 等面板清空时主动中断，让测试确实覆盖未结束的流。
+          return;
+        }
         // 分 3 段推送，顺便验证 SSE 跨 chunk 拼接；拼起来必须等于 MOCK_REPLY_MD
         const chunks = [
           '**总结**：',
@@ -599,7 +607,8 @@ try {
   const broadcastText = '侧边栏广播测试：量子比特「同时处于叠加态」在这篇文章里是什么含义？';
   await evaluate(
     sw,
-    `chrome.runtime.sendMessage({ type: 'SELECTION', text: ${JSON.stringify(broadcastText)} }).catch(() => null)`
+    `chrome.storage.local.set({ pendingSelection: { text: ${JSON.stringify(broadcastText)}, at: Date.now() } })
+      .then(() => chrome.runtime.sendMessage({ type: 'SELECTION', pending: true }).catch(() => null))`
   );
   {
     const deadline = Date.now() + 12000;
@@ -664,30 +673,106 @@ try {
     );
   }
 
-  // 关掉测试用的侧边栏标签页，避免它和底部 dock 同时响应后续广播
-  {
-    const candidates = await listTargets();
-    const sidePageTarget = candidates.find(
-      (target) => target.type === 'page' && String(target.url).includes('/sidepanel/index.html')
-    );
-    if (sidePageTarget) {
-      await browser.send('Target.closeTarget', { targetId: sidePageTarget.id }).catch(() => {});
-      const deadline = Date.now() + 5000;
-      while (
-        Date.now() < deadline &&
-        (await listTargets()).some((target) => target.id === sidePageTarget.id)
-      ) {
-        await sleep(150);
-      }
-      if ((await listTargets()).some((target) => target.id === sidePageTarget.id)) {
-        const sideTabs = await evaluate(sw, 'chrome.tabs.query({})');
-        const sideTab = sideTabs.find((tab) => String(tab.url || '').includes('/sidepanel/index.html'));
-        if (sideTab) await evaluate(sw, `chrome.tabs.remove(${sideTab.id})`);
-      }
+  // 关闭确切的扩展页面 target（不是刷新或只断开 CDP），再创建新 target 验证持久化。
+  async function closeSideTarget(target, client) {
+    const result = await browser.send('Target.closeTarget', { targetId: target.id });
+    if (!result.success) fail(`关闭侧边栏 target 失败：${target.id}`);
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && (await listTargets()).some((item) => item.id === target.id)) {
+      await sleep(150);
     }
-    side.close();
-    await sleep(300);
+    if ((await listTargets()).some((item) => item.id === target.id)) {
+      fail(`侧边栏 target 仍未关闭：${target.id}`);
+    }
+    client.close();
   }
+  async function reopenSideTarget() {
+    const target = await openTarget(`chrome-extension://${extId}/sidepanel/index.html`);
+    const client = connect(target.webSocketDebuggerUrl);
+    clients.push(client);
+    await client.send('Runtime.enable');
+    await waitFor(client, 'document.readyState === "complete"');
+    await waitFor(client, '!!document.getElementById("sendBtn")');
+    return { target, client };
+  }
+
+  // 等待完整回答及异步存储完成，避免在流式渲染中途关闭页面。
+  await waitFor(side, '!document.getElementById("sendBtn").disabled', 8000, '广播回答完成');
+  const settingsBeforeClear = await evaluate(sw, "chrome.storage.local.get('settings').then(result => result.settings)");
+  await closeSideTarget(sideTarget, side);
+  const restored = await reopenSideTarget();
+  await waitFor(
+    restored.client,
+    `(() => {
+      const users = Array.from(document.querySelectorAll('#messages .msg.user'));
+      const answers = Array.from(document.querySelectorAll('#messages .msg.assistant'));
+      return users.some(el => el.textContent.includes(${JSON.stringify(broadcastText)})) &&
+        answers.some(el => el.textContent.includes(${JSON.stringify(MOCK_REPLY_TEXT)}));
+    })()`,
+    8000,
+    '关闭并重新打开后恢复用户消息和 AI 回答'
+  );
+
+  const followUp = '重开后的追问：请继续解释刚才的内容。';
+  serverHandle.captured.chatRequest = null;
+  await evaluate(restored.client, `(() => {
+    document.getElementById('input').value = ${JSON.stringify(followUp)};
+    document.getElementById('sendBtn').click();
+  })()`, { awaitPromise: false });
+  await waitFor(restored.client, '!document.getElementById("sendBtn").disabled', 10000, '追问回答完成');
+  const followRequest = serverHandle.captured.chatRequest;
+  const followMessages = followRequest?.messages || [];
+  const priorUserIndex = followMessages.findIndex(m => m.role === 'user' && String(m.content).includes(broadcastText));
+  const priorAnswerIndex = followMessages.findIndex((m, i) => i > priorUserIndex && m.role === 'assistant' && m.content === MOCK_REPLY_MD);
+  if (priorUserIndex < 0 || priorAnswerIndex <= priorUserIndex ||
+      followMessages.at(-1)?.role !== 'user' || followMessages.at(-1)?.content !== followUp ||
+      priorAnswerIndex >= followMessages.length - 1) {
+    fail(`重开后的追问未按顺序携带历史：${JSON.stringify(followMessages)}`);
+  }
+  await evaluate(restored.client, `(() => {
+    document.getElementById('input').value = ${JSON.stringify(CLEAR_DURING_STREAM)};
+    document.getElementById('sendBtn').click();
+  })()`, { awaitPromise: false });
+  await waitFor(restored.client, `document.querySelector('.streaming-cursor')?.textContent === ${JSON.stringify(PARTIAL_REPLY)}`, 5000, '清空前已有正在生成的回答');
+  await evaluate(restored.client, 'document.getElementById("clearBtn").click()', { awaitPromise: false });
+  await waitFor(restored.client, `!!document.querySelector('#messages .empty') &&
+    !document.getElementById('clearBtn').disabled && !document.getElementById('sendBtn').disabled`, 5000, '清空界面并停止生成');
+  await closeSideTarget(restored.target, restored.client);
+
+  const cleared = await reopenSideTarget();
+  // 等待初始化完成后再检查，防止异步恢复历史在断言之后才发生。
+  await waitFor(cleared.client, `document.getElementById('modelTag').textContent === 'mock-model'`, 8000, '设置与历史加载');
+  const remaining = await evaluate(cleared.client, `Array.from(document.querySelectorAll('#messages .msg.user, #messages .msg.assistant')).map(el => el.textContent)`);
+  if (remaining.length) fail(`清空后重开仍有消息：${JSON.stringify(remaining)}`);
+  const settingsAfterClear = await evaluate(sw, "chrome.storage.local.get('settings').then(result => result.settings)");
+  if (JSON.stringify(settingsAfterClear) !== JSON.stringify(settingsBeforeClear)) fail('清空对话更改了已保存设置');
+  const settingsUi = await evaluate(cleared.client, `(() => {
+    document.getElementById('settingsBtn').click();
+    const result = { baseUrl: document.getElementById('baseUrl').value, apiKey: document.getElementById('apiKey').value,
+      model: document.getElementById('model').value, panelMode: document.getElementById('panelMode').value };
+    document.getElementById('settingsDialog').close();
+    return result;
+  })()`);
+  if (settingsUi.baseUrl !== `${serverHandle.baseUrl}/v1` || settingsUi.apiKey !== 'sk-test' ||
+      settingsUi.model !== 'mock-model' || settingsUi.panelMode !== 'side') fail('清空后重开没有保留设置');
+
+  const freshText = '清空重开后的新问题：量子计算是什么？';
+  serverHandle.captured.chatRequest = null;
+  await evaluate(cleared.client, `(() => {
+    document.getElementById('input').value = ${JSON.stringify(freshText)};
+    document.getElementById('sendBtn').click();
+  })()`, { awaitPromise: false });
+  await waitFor(cleared.client, '!document.getElementById("sendBtn").disabled', 10000, '新对话回答完成');
+  const freshRequest = serverHandle.captured.chatRequest;
+  const freshMessages = freshRequest?.messages || [];
+  if (freshRequest?.model !== 'mock-model' || freshRequest?.temperature !== 0.2 ||
+      freshMessages.length !== 2 || freshMessages[0]?.role !== 'system' ||
+      freshMessages[1]?.role !== 'user' || freshMessages[1]?.content !== freshText ||
+      !String(freshMessages[0]?.content || '').includes('你是测试用阅读助手。')) {
+    fail(`清空重开后的请求不是使用原设置的新对话：${JSON.stringify(freshRequest)}`);
+  }
+  console.log('     侧边栏关闭重开恢复历史及追问；清空后重开保持设置并发送新对话 ✅');
+  await closeSideTarget(cleared.target, cleared.client);
 
   // ============ 8. 显式切换到底部模式 ============
   log('8/8', '切到 panelMode=bottom → 划词点「问 AI」→ dock 展开 → 轮询追问');
@@ -787,6 +872,9 @@ try {
   }
   if (!String(dockRequest.messages?.[0]?.content || '').includes('量子比特')) {
     fail('dock 请求没有附带页面正文');
+  }
+  if (dockRequest.messages?.[1]?.content !== freshText || dockRequest.messages?.[2]?.content !== MOCK_REPLY_MD) {
+    fail('底部 dock 没有继续使用侧边栏的对话历史');
   }
   console.log('     dock iframe 已消费点击产生的选区，请求含选区 + 页面正文 ✅');
 
