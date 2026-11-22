@@ -904,9 +904,10 @@ try {
   const translateSystem = String(translateRequest?.messages?.[0]?.content || '');
   const translateUser = String(translateRequest?.messages?.at(-1)?.content || '');
   if (translateRequest?.stream !== true || !translateUser.includes('翻译') ||
-      !translateUser.includes('简体中文') || !translateSystem.includes(translateBodyMarker) ||
+      !translateUser.includes('简体中文') || !translateUser.includes('Markdown') ||
+      !translateSystem.includes(translateBodyMarker) ||
       translateSystem.includes(translateSelectionMarker) || translateUser.includes(translateSelectionMarker)) {
-    fail(`翻译请求未使用最新正文或包含选区：${JSON.stringify(translateRequest)}`);
+    fail(`翻译请求应使用最新正文、要求简体中文 Markdown，且不附带选区：${JSON.stringify(translateRequest)}`);
   }
   await evaluate(page, `(() => {
     document.getElementById('translate-body-fixture').remove();
@@ -1106,7 +1107,7 @@ try {
   console.log('   - 侧边栏页面：设置弹窗默认 panelMode=side，可正常打开');
   console.log('   - 侧边栏读取当前页面 → 页面字数');
   console.log('   - 总结本页 → SSE 流式渲染，请求携带页面正文');
-  console.log('   - 翻译本页 → 重新提取正文、简体中文指令、不带选区、流式渲染；底部模式按钮存在');
+  console.log('   - 翻译本页 → 重新提取正文、简体中文 Markdown 指令、不带选区、流式渲染；底部模式按钮存在');
   console.log('   - 回答复制：复制原始 Markdown + 「已复制」反馈，用户消息无按钮；dock iframe 允许 clipboard-write');
   console.log('   - 侧边栏收到 SELECTION 广播 → 请求携带选区 + 页面正文');
   console.log('   - 显式切到 panelMode=bottom（等 background 生效）→ 划词点「问 AI」→ dock 展开（?embed=bottom）');

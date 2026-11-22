@@ -621,7 +621,7 @@ async function translatePage() {
     return;
   }
   // 显式翻译需要本页正文，但不改变普通提问的「附带页面」设置。
-  await send('请把当前页面的正文逐段翻译成简体中文，保留标题、段落和列表结构。已有的简体中文内容保持原样。只输出译文，不要总结或补写。', { pageContext });
+  await send('请把当前页面正文逐段翻译成简体中文，使用 Markdown 输出，保留原有标题、段落和列表结构；代码保持原样，仅对原有代码使用代码格式，不要用代码围栏包裹整篇译文。已有的简体中文内容保持原样。只输出译文，不要总结或补写。', { pageContext });
 }
 
 function bindEvents() {
@@ -691,11 +691,8 @@ async function consumePendingSelection() {
 }
 
 chrome.runtime.onMessage.addListener((message) => {
-  if (!message) return;
-  if (message.type === 'SELECTION' && message.pending) {
+  if (message?.type === 'SELECTION' && message.pending) {
     ready.then(consumePendingSelection).catch(() => {});
-  } else if (message.type === 'SUMMARIZE_PAGE') {
-    ready.then(() => summarizePage()).catch(() => {});
   }
 });
 

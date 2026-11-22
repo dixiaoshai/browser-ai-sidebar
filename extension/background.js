@@ -8,7 +8,7 @@
  */
 
 const MENU_EXPLAIN = 'ai-sidebar-explain-selection';
-const MENU_SUMMARIZE = 'ai-sidebar-summarize-page';
+const MENU_OPEN_SIDE_PANEL = 'ai-sidebar-open-side-panel';
 const MAX_SELECTION = 6000;
 
 // 面板模式缓存：让用户手势（工具栏点击、右键菜单等）能同步决策，不用先 await storage
@@ -87,8 +87,8 @@ async function setupMenus() {
     contexts: ['selection']
   });
   chrome.contextMenus.create({
-    id: MENU_SUMMARIZE,
-    title: '用 AI 总结本页',
+    id: MENU_OPEN_SIDE_PANEL,
+    title: '打开 AI 侧边栏',
     contexts: ['page']
   });
 }
@@ -122,9 +122,8 @@ chrome.action.onClicked.addListener((tab) => {
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (!tab || typeof tab.id !== 'number') return;
 
-  if (info.menuItemId === MENU_SUMMARIZE) {
-    openPanel(tab.id);
-    broadcast({ type: 'SUMMARIZE_PAGE' });
+  if (info.menuItemId === MENU_OPEN_SIDE_PANEL) {
+    openSidePanel(tab.id);
     return;
   }
 
